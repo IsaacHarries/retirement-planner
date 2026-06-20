@@ -121,33 +121,35 @@ function contributionFor(s, age) {
   return amt * inflFactor(s, age);
 }
 
-function project(s) {
-  const annualSpendToday = (s.monthlyNeed + s.monthlyExtra) * 12;
-  // Social Security offsets the spending you must self-fund, lowering the target
-  // across the whole projection (not just once benefits start) — it's a future
-  // income stream that reduces the nest egg you need today.
-  const targetAt = (i) => {
-    const spend = annualSpendToday * Math.pow(1 + s.inflation, i);
-    const ss = s.includeSS ? s.ssAnnual * Math.pow(1 + s.inflation, i) : 0;
+// One person's projection indexed by year-offset t (0..T), so multiple people on
+// a shared timeline can be summed into a household. Social Security offsets the
+// spending you must self-fund, lowering the target across the whole projection.
+function projectPerson(s, T) {
+  const spend0 = (s.monthlyNeed + s.monthlyExtra) * 12;
+  const targetAt = (t) => {
+    const spend = spend0 * Math.pow(1 + s.inflation, t);
+    const ss = s.includeSS ? s.ssAnnual * Math.pow(1 + s.inflation, t) : 0;
     return Math.max(0, spend - ss) / s.wr;
   };
-  const rows = [];
-  let avg = s.balance;
-  let low = s.balance;
-  rows.push({ age: s.currentAge, avg, low, target: targetAt(0) });
-  for (let i = 1; i <= s.horizonAge - s.currentAge; i++) {
-    const workAge = s.currentAge + i - 1;            // age during the year saved
+  const avg = [s.balance], low = [s.balance], target = [targetAt(0)];
+  let a = s.balance, l = s.balance;
+  for (let t = 1; t <= T; t++) {
+    const workAge = s.currentAge + t - 1;            // age during the year saved
     const working = workAge < s.retireAge;
     const contrib = working ? contributionFor(s, workAge) : 0;
-    avg = avg * (1 + s.avgRet) + contrib;
-    low = low * (1 + s.lowRet) + contrib;
-    rows.push({ age: s.currentAge + i, avg, low, target: targetAt(i) });
+    a = a * (1 + s.avgRet) + contrib;
+    l = l * (1 + s.lowRet) + contrib;
+    avg.push(a); low.push(l); target.push(targetAt(t));
   }
-  const cross = (key) => {
-    const r = rows.find((row) => row[key] >= row.target);
-    return r ? { age: r.age, value: r[key], target: r.target } : null;
-  };
-  return { rows, annualSpendToday, avgCross: cross("avg"), lowCross: cross("low") };
+  return { avg, low, target, spend0, grossCoast: solveGross(spend0, 0, 0) };
+}
+
+// Saving for a person in a given period, as a today's-$ total and a label.
+function savedTodayOf(st, when) {
+  const pct = when === "after" ? st.pct401kAfter + st.pctRothAfter : st.pct401kBefore + st.pctRothBefore;
+  const amt = when === "after" ? st.amt401kAfter + st.amtRothAfter : st.amt401kBefore + st.amtRothBefore;
+  const mode = when === "after" ? st.contribModeAfter : st.contribModeBefore;
+  return mode === "percent" ? (when === "after" ? st.incomeAfter : st.income) * pct : amt;
 }
 
 // ---- small UI atoms --------------------------------------------------------
@@ -219,12 +221,27 @@ const DEFAULTS = {
 const STORAGE_KEY = "retirement-crossover-settings";
 const THEME_KEY = "retirement-crossover-theme";
 
-function loadInitial() {
+// Persisted shape: { people: [{ name, settings }], activeIndex }. Older builds
+// stored a single flat settings object — migrate that into one person.
+function loadState() {
   try {
     const raw = localStorage.getItem(STORAGE_KEY);
-    if (raw) return { ...DEFAULTS, ...JSON.parse(raw) };
+    if (raw) {
+      const parsed = JSON.parse(raw);
+      if (parsed && Array.isArray(parsed.people) && parsed.people.length) {
+        const people = parsed.people.map((p, i) => ({
+          name: typeof p.name === "string" ? p.name : `Person ${i + 1}`,
+          settings: { ...DEFAULTS, ...(p.settings || {}) },
+        }));
+        const activeIndex = Math.min(Math.max(0, parsed.activeIndex | 0), people.length - 1);
+        return { people, activeIndex };
+      }
+      if (parsed && typeof parsed === "object") {
+        return { people: [{ name: "Person 1", settings: { ...DEFAULTS, ...parsed } }], activeIndex: 0 };
+      }
+    }
   } catch (e) { /* ignore */ }
-  return DEFAULTS;
+  return { people: [{ name: "Person 1", settings: DEFAULTS }], activeIndex: 0 };
 }
 function loadTheme() {
   try {
@@ -235,21 +252,42 @@ function loadTheme() {
 }
 
 export default function App() {
-  const [s, setS] = useState(loadInitial);
+  const [store, setStore] = useState(loadState); // { people, activeIndex }
   const [saveState, setSaveState] = useState("idle");
   const [theme, setTheme] = useState(loadTheme);
+  const [viewMode, setViewMode] = useState("combined"); // "combined" | "perPerson"
   const C = THEMES[theme];
+
+  const { people, activeIndex } = store;
+  const s = people[activeIndex].settings; // active person's settings (left column)
 
   useEffect(() => {
     try {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(s));
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(store));
       setSaveState("saved");
       const t = setTimeout(() => setSaveState("idle"), 1400);
       return () => clearTimeout(t);
     } catch (e) {
       console.error("Could not save settings", e);
     }
-  }, [s]);
+  }, [store]);
+
+  // --- people (tabs) ---
+  const selectPerson = (index) => setStore((st) => ({ ...st, activeIndex: index }));
+  const addPerson = () => setStore((st) => ({
+    people: [...st.people, { name: `Person ${st.people.length + 1}`, settings: DEFAULTS }],
+    activeIndex: st.people.length,
+  }));
+  const renamePerson = (index, name) => setStore((st) => ({
+    ...st, people: st.people.map((p, i) => (i === index ? { ...p, name } : p)),
+  }));
+  const removePerson = (index) => setStore((st) => {
+    if (st.people.length <= 1) return st;
+    const people = st.people.filter((_, i) => i !== index);
+    let activeIndex = index < st.activeIndex ? st.activeIndex - 1 : st.activeIndex;
+    activeIndex = Math.max(0, Math.min(activeIndex, people.length - 1));
+    return { people, activeIndex };
+  });
 
   useEffect(() => {
     try { localStorage.setItem(THEME_KEY, theme); } catch (e) { /* ignore */ }
@@ -258,6 +296,15 @@ export default function App() {
     // Render native controls (number-input spinners, scrollbars) for the theme.
     document.documentElement.style.colorScheme = theme;
   }, [theme, C.page]);
+
+  // Update the active person's settings (accepts a value or an updater fn).
+  const setS = (upd) => setStore((st) => ({
+    ...st,
+    people: st.people.map((p, i) =>
+      i === st.activeIndex
+        ? { ...p, settings: typeof upd === "function" ? upd(p.settings) : upd }
+        : p),
+  }));
 
   const set = (k) => (v) => setS((p) => ({ ...p, [k]: v }));
 
@@ -282,41 +329,64 @@ export default function App() {
     });
   };
 
-  const { rows, annualSpendToday, avgCross, lowCross } =
-    useMemo(() => project(s), [s]);
+  // What the right column shows: the whole household (combined) or just the
+  // active tab's person (per person). Switching tabs re-points the per-person view.
+  const multi = people.length > 1;
+  const combined = !multi || viewMode === "combined";
+  const viewSettings = combined ? people.map((p) => p.settings) : [people[activeIndex].settings];
+  const refAge = viewSettings[0].currentAge; // x-axis anchored to the viewed person(s)
+  const viewName = combined ? "Household" : people[activeIndex].name;
+  const singleView = viewSettings.length === 1; // one person on the charts
+  const refName = combined ? people[0].name : people[activeIndex].name; // whose age anchors the axis
+  const scopeLabel = !multi ? "" : combined ? "Household " : viewName + " "; // footer prefix
 
-  // Gross salary (today's $) needed just to net your spending — the income floor.
-  const grossCoast = useMemo(() => solveGross(annualSpendToday, 0, 0), [annualSpendToday]);
+  const { rows, avgCross, lowCross, annualSpendToday } = useMemo(() => {
+    const T = Math.max(1, ...viewSettings.map((st) => st.horizonAge - st.currentAge));
+    const per = viewSettings.map((st) => projectPerson(st, T));
+    const rows = [];
+    for (let t = 0; t <= T; t++) {
+      let avg = 0, low = 0, target = 0;
+      for (const pp of per) { avg += pp.avg[t]; low += pp.low[t]; target += pp.target[t]; }
+      rows.push({ t, age: refAge + t, avg, low, target });
+    }
+    const cross = (key) => {
+      const r = rows.find((row) => row[key] >= row.target);
+      return r ? { age: r.age, t: r.t, value: r[key], target: r.target } : null;
+    };
+    return {
+      rows,
+      avgCross: cross("avg"),
+      lowCross: cross("low"),
+      annualSpendToday: viewSettings.reduce((sum, st) => sum + (st.monthlyNeed + st.monthlyExtra) * 12, 0),
+    };
+  }, [store, viewMode]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const chartRows = rows.filter((r) => r.age <= 76);
 
-  // Income plan: your income trajectory (with the job change), the salary needed
-  // to cover spending, and what you actually save each year.
+  // Income plan for the current view: income, salary-to-cover-spending, saving.
+  const grossCoastList = viewSettings.map((st) => solveGross((st.monthlyNeed + st.monthlyExtra) * 12, 0, 0));
+  const grossCoastNow = grossCoastList.reduce((a, b) => a + b, 0);
   const incomeRows = chartRows.map((r) => {
-    const infl = Math.pow(1 + s.inflation, r.age - s.currentAge);
-    const working = r.age < s.retireAge;
-    return {
-      age: r.age,
-      income: working ? incomeAt(s, r.age) : null,
-      cover: working ? grossCoast * infl : null,        // earn this → just cover spending
-      contrib: working ? contributionFor(s, r.age) : null, // saved that year
-    };
+    let income = 0, cover = 0, contrib = 0, working = false;
+    viewSettings.forEach((st, idx) => {
+      const age = st.currentAge + r.t;
+      if (age < st.retireAge) {
+        working = true;
+        income += incomeAt(st, age);
+        contrib += contributionFor(st, age);
+        cover += grossCoastList[idx] * Math.pow(1 + st.inflation, r.t);
+      }
+    });
+    return { age: r.age, income: working ? income : null, cover: working ? cover : null, contrib: working ? contrib : null };
   });
 
-  // After the change: can your income comfortably cover spending + your chosen saving?
-  const effectiveIncome = s.jobChange ? s.incomeAfter : s.income;
-  // Saving totals (today's $) and labels for each period, given its own mode.
-  const periodPct = (when) => when === "after" ? s.pct401kAfter + s.pctRothAfter : s.pct401kBefore + s.pctRothBefore;
-  const periodAmt = (when) => when === "after" ? s.amt401kAfter + s.amtRothAfter : s.amt401kBefore + s.amtRothBefore;
-  const modeFor = (when) => when === "after" ? s.contribModeAfter : s.contribModeBefore;
-  const savedToday = (when) => modeFor(when) === "percent"
-    ? (when === "after" ? s.incomeAfter : s.income) * periodPct(when)
-    : periodAmt(when);
-  const savedLabel = (when) => modeFor(when) === "percent"
-    ? `${Math.round(periodPct(when) * 100)}%`
-    : compact(periodAmt(when));
-  const effectiveContrib = savedToday(s.jobChange ? "after" : "before");
-  const disposable = netTakeHome(effectiveIncome, 0, 0) - annualSpendToday;
+  // "Now" figures for the footer, summed over whatever's in view.
+  const incomeNow = viewSettings.reduce((sum, st) => sum + st.income, 0);
+  const savedNow = viewSettings.reduce((sum, st) => sum + savedTodayOf(st, "before"), 0);
+  const targetToday = rows[0].target;
+  const disposable = viewSettings.reduce(
+    (sum, st) => sum + (netTakeHome(st.jobChange ? st.incomeAfter : st.income, 0, 0) - (st.monthlyNeed + st.monthlyExtra) * 12), 0);
+  const effectiveContrib = viewSettings.reduce((sum, st) => sum + savedTodayOf(st, st.jobChange ? "after" : "before"), 0);
   const savingStatus =
     disposable >= effectiveContrib ? { text: "fully funded", color: C.avg }
     : disposable >= 0 ? { text: "saving is a stretch", color: C.brass }
@@ -339,6 +409,7 @@ export default function App() {
         .rc-pane{display:flex;flex-direction:column;gap:16px;overflow-y:auto;min-height:0;height:100%;
           padding:22px 6px 26px 0;}
         .rc-col{display:flex;flex-direction:column;gap:16px;}
+        .rc-tabs{display:flex;flex-wrap:wrap;gap:6px;align-items:center;}
         input[type=number]::-webkit-outer-spin-button,
         input[type=number]::-webkit-inner-spin-button{opacity:.4;}
         @media (max-width:860px){
@@ -362,6 +433,14 @@ export default function App() {
             opacity: saveState === "saved" ? 1 : 0, transition: "opacity .3s" }}>
             ✓ saved
           </span>
+          {multi && (
+            <button onClick={() => setViewMode((m) => (m === "combined" ? "perPerson" : "combined"))}
+              title="Combined household vs. per-person curves"
+              style={{ fontFamily: sans, fontSize: 12, color: C.inkSoft, background: "transparent",
+                border: `1px solid ${C.hair}`, borderRadius: 7, padding: "5px 11px", cursor: "pointer" }}>
+              {viewMode === "combined" ? "Combined" : "Per person"}
+            </button>
+          )}
           <button onClick={() => setTheme((t) => (t === "dark" ? "light" : "dark"))}
             title="Toggle light / dark"
             style={{ fontFamily: sans, fontSize: 12, color: C.inkSoft, background: "transparent",
@@ -374,7 +453,39 @@ export default function App() {
       {/* two-panel layout: controls left, charts right — each scrolls independently */}
       <div className="rc-main">
         {/* ---- left: controls ---- */}
-        <div className="rc-pane">
+        <div className="rc-pane" style={{ paddingTop: 0 }}>
+          {/* person tabs — each tab is one person's inputs; charts combine them */}
+          <div className="rc-tabs" style={{ position: "sticky", top: 0, zIndex: 5,
+            background: C.page, padding: "8px 0", borderBottom: `1px solid ${C.hair}` }}>
+            {people.map((p, i) => (
+              i === activeIndex ? (
+                <span key={i} style={{ display: "inline-flex", alignItems: "center", gap: 2, height: 30,
+                  border: `1px solid ${C.brass}`, borderRadius: 8, background: C.card, padding: "0 4px 0 8px" }}>
+                  <input value={p.name} onChange={(e) => renamePerson(i, e.target.value)}
+                    size={Math.max(4, p.name.length)} aria-label="Tab name"
+                    style={{ border: "none", outline: "none", background: "transparent", color: C.ink,
+                      fontFamily: sans, fontSize: 13, fontWeight: 600 }} />
+                  {people.length > 1 && (
+                    <button onClick={() => removePerson(i)} title="Remove person"
+                      style={{ border: "none", background: "transparent", color: C.inkSoft,
+                        cursor: "pointer", fontSize: 14, lineHeight: 1, padding: "0 2px" }}>×</button>
+                  )}
+                </span>
+              ) : (
+                <button key={i} onClick={() => selectPerson(i)}
+                  style={{ display: "inline-flex", alignItems: "center", height: 30, border: `1px solid ${C.hair}`,
+                    borderRadius: 8, background: "transparent", color: C.inkSoft, fontFamily: sans,
+                    fontSize: 13, padding: "0 10px", cursor: "pointer" }}>
+                  {p.name || "Untitled"}
+                </button>
+              )
+            ))}
+            <button onClick={addPerson} title="Add person"
+              style={{ display: "inline-flex", alignItems: "center", justifyContent: "center", height: 30,
+                border: `1px dashed ${C.hair}`, borderRadius: 8, background: "transparent",
+                color: C.inkSoft, fontFamily: sans, fontSize: 15, lineHeight: 1, padding: "0 11px", cursor: "pointer" }}>+</button>
+          </div>
+
           <div style={{ ...card, padding: 16 }}>
               <div className="rc-col">
                 <div style={{ fontFamily: serif, fontSize: 18 }}>You today</div>
@@ -505,6 +616,16 @@ export default function App() {
               the salary each phase needs. Inputs are saved automatically.
             </p>
 
+            {multi && (
+              <div style={{ display: "flex", alignItems: "baseline", flexWrap: "wrap", gap: 8,
+                borderTop: `1px solid ${C.hair}`, paddingTop: 12 }}>
+                <span style={{ fontFamily: serif, fontSize: 22, color: C.ink }}>{viewName}</span>
+                <span style={{ fontFamily: sans, fontSize: 12, color: C.inkSoft }}>
+                  {combined ? "combined household" : "individual plan — switch tabs to compare people"}
+                </span>
+              </div>
+            )}
+
             {/* chart 1: the crossover */}
             <div style={{ ...card, padding: "18px 14px 8px" }}>
               <div style={{ fontFamily: serif, fontSize: 18, padding: "0 6px 6px" }}>The crossover</div>
@@ -546,7 +667,7 @@ export default function App() {
                 flexWrap: "wrap", gap: 8, padding: "0 6px 2px" }}>
                 <div style={{ fontFamily: serif, fontSize: 18 }}>The income plan</div>
                 <div style={{ fontFamily: mono, fontSize: 12, color: C.inkSoft }}>
-                  cover spending ≈ {usd(grossCoast)}/yr (today’s $)
+                  cover spending ≈ {usd(grossCoastNow)}/yr (today’s $)
                 </div>
               </div>
               <div style={{ fontSize: 12, color: C.inkSoft, padding: "0 6px 8px", lineHeight: 1.45 }}>
@@ -558,31 +679,31 @@ export default function App() {
                 <ResponsiveContainer>
                   <LineChart data={incomeRows} margin={{ top: 10, right: 18, bottom: 4, left: 6 }}>
                     <CartesianGrid stroke={C.hair} vertical={false} />
-                    <XAxis dataKey="age" type="number" domain={[s.currentAge, 76]}
+                    <XAxis dataKey="age" type="number" domain={[refAge, 76]}
                       tick={{ fontSize: 12, fill: C.inkSoft, fontFamily: mono }}
                       tickLine={false} axisLine={{ stroke: C.hair }}
-                      ticks={[40, 45, 50, 55, 60, 65, 70, 75].filter((t) => t >= s.currentAge)} />
+                      ticks={[40, 45, 50, 55, 60, 65, 70, 75].filter((t) => t >= refAge)} />
                     <YAxis tickFormatter={compact} width={56} domain={[0, "auto"]}
                       tick={{ fontSize: 12, fill: C.inkSoft, fontFamily: mono }}
                       tickLine={false} axisLine={false} />
                     <Tooltip {...tooltip} formatter={(v, n) => [usd(v), n]} labelFormatter={(a) => `Age ${a}`} />
                     <Legend wrapperStyle={{ fontFamily: sans, fontSize: 12, paddingTop: 6 }} />
-                    {s.retireAge <= 76 && s.retireAge >= s.currentAge && (
+                    {singleView && s.retireAge <= 76 && s.retireAge >= refAge && (
                       <ReferenceLine x={s.retireAge} stroke={C.brass} strokeDasharray="4 4"
                         label={{ value: `retire ${s.retireAge}`, position: "insideTopRight",
                           fill: C.brass, fontSize: 11, fontFamily: mono }} />
                     )}
-                    {s.jobChange && s.changeAge <= 76 && s.changeAge >= s.currentAge && (
+                    {singleView && s.jobChange && s.changeAge <= 76 && s.changeAge >= refAge && (
                       <ReferenceLine x={s.changeAge} stroke={C.brass} strokeDasharray="4 4"
                         label={{ value: `job change ${s.changeAge}`, position: "insideTopLeft",
                           fill: C.brass, fontSize: 11, fontFamily: mono }} />
                     )}
-                    {avgCross && avgCross.age <= 76 && avgCross.age >= s.currentAge && (
+                    {avgCross && avgCross.age <= 76 && (
                       <ReferenceLine x={avgCross.age} stroke={C.avg} strokeDasharray="3 3"
                         label={{ value: `crossover ${avgCross.age}`, position: "insideBottomRight",
                           fill: C.avg, fontSize: 11, fontFamily: mono }} />
                     )}
-                    {lowCross && lowCross.age <= 76 && lowCross.age >= s.currentAge && (
+                    {lowCross && lowCross.age <= 76 && (
                       <ReferenceLine x={lowCross.age} stroke={C.low} strokeDasharray="3 3"
                         label={{ value: `crossover ${lowCross.age}`, position: "insideBottomLeft",
                           fill: C.low, fontSize: 11, fontFamily: mono }} />
@@ -591,7 +712,7 @@ export default function App() {
                       stroke={C.coverLine} strokeWidth={2} strokeDasharray="5 4" dot={false} connectNulls={false} />
                     <Line type="monotone" dataKey="contrib" name="Saved per year"
                       stroke={C.saved} strokeWidth={2} dot={false} connectNulls={false} />
-                    <Line type="monotone" dataKey="income" name="Your income"
+                    <Line type="monotone" dataKey="income" name={singleView ? "Income" : "Household income"}
                       stroke={C.ink} strokeWidth={2.75} dot={false} connectNulls={false} />
                   </LineChart>
                 </ResponsiveContainer>
@@ -613,7 +734,7 @@ export default function App() {
                     </tr>
                   </thead>
                   <tbody>
-                    {rows.filter((r) => (r.age - s.currentAge) % 3 === 0 && r.age <= 76).map((r) => {
+                    {rows.filter((r) => r.t % 3 === 0 && r.age <= 76).map((r) => {
                       const hit = (avgCross && r.age === avgCross.age) || (lowCross && r.age === lowCross.age);
                       return (
                         <tr key={r.age} style={{ background: hit ? C.highlight : "transparent" }}>
@@ -651,9 +772,9 @@ export default function App() {
               <div style={{ fontSize: 10, letterSpacing: ".05em", textTransform: "uppercase", color: C.inkSoft }}>Average market</div>
               {avgCross ? (
                 <>
-                  <div style={{ fontFamily: serif, fontSize: 17, color: C.ink, lineHeight: 1.15 }}>Retire {avgCross.age}</div>
-                  <div style={{ fontFamily: mono, fontSize: 11, color: C.inkSoft, lineHeight: 1.3 }}>{avgCross.age - s.currentAge} yrs · ~{compact(avgCross.value)} saved</div>
-                  <div style={{ fontFamily: mono, fontSize: 11, color: C.inkSoft, lineHeight: 1.3 }}>{usd(avgCross.value * s.wr / 12)}/mo · {usd(avgCross.value * s.wr / 12 / Math.pow(1 + s.inflation, avgCross.age - s.currentAge))} today</div>
+                  <div style={{ fontFamily: serif, fontSize: 17, color: C.ink, lineHeight: 1.15 }}>in {avgCross.t} yrs</div>
+                  <div style={{ fontFamily: mono, fontSize: 11, color: C.inkSoft, lineHeight: 1.3 }}>~{compact(avgCross.value)} saved · {refName} age {avgCross.age}</div>
+                  <div style={{ fontFamily: mono, fontSize: 11, color: C.inkSoft, lineHeight: 1.3 }}>funds {usd(annualSpendToday / 12)}/mo today</div>
                 </>
               ) : (
                 <div style={{ fontFamily: serif, fontSize: 15, color: C.ink }}>Not reached</div>
@@ -667,9 +788,9 @@ export default function App() {
               <div style={{ fontSize: 10, letterSpacing: ".05em", textTransform: "uppercase", color: C.inkSoft }}>Below-average</div>
               {lowCross ? (
                 <>
-                  <div style={{ fontFamily: serif, fontSize: 17, color: C.ink, lineHeight: 1.15 }}>Retire {lowCross.age}</div>
-                  <div style={{ fontFamily: mono, fontSize: 11, color: C.inkSoft, lineHeight: 1.3 }}>{lowCross.age - s.currentAge} yrs · ~{compact(lowCross.value)} saved</div>
-                  <div style={{ fontFamily: mono, fontSize: 11, color: C.inkSoft, lineHeight: 1.3 }}>{usd(lowCross.value * s.wr / 12)}/mo · {usd(lowCross.value * s.wr / 12 / Math.pow(1 + s.inflation, lowCross.age - s.currentAge))} today</div>
+                  <div style={{ fontFamily: serif, fontSize: 17, color: C.ink, lineHeight: 1.15 }}>in {lowCross.t} yrs</div>
+                  <div style={{ fontFamily: mono, fontSize: 11, color: C.inkSoft, lineHeight: 1.3 }}>~{compact(lowCross.value)} saved · {refName} age {lowCross.age}</div>
+                  <div style={{ fontFamily: mono, fontSize: 11, color: C.inkSoft, lineHeight: 1.3 }}>funds {usd(annualSpendToday / 12)}/mo today</div>
                 </>
               ) : (
                 <div style={{ fontFamily: serif, fontSize: 15, color: C.ink }}>Not reached</div>
@@ -680,20 +801,16 @@ export default function App() {
           <div style={{ flex: "1 1 0", minWidth: 0 }}>
             <div style={{ fontSize: 10, letterSpacing: ".05em", textTransform: "uppercase", color: C.inkSoft }}>Spending</div>
             <div style={{ fontFamily: serif, fontSize: 17, color: C.ink, lineHeight: 1.15 }}>{usd(annualSpendToday)}/yr</div>
-            <div style={{ fontFamily: mono, fontSize: 11, color: C.inkSoft, lineHeight: 1.3 }}>target ≈ {compact(Math.max(0, annualSpendToday - (s.includeSS ? s.ssAnnual : 0)) / s.wr)} today</div>
+            <div style={{ fontFamily: mono, fontSize: 11, color: C.inkSoft, lineHeight: 1.3 }}>target ≈ {compact(targetToday)} today</div>
           </div>
           <div style={{ width: 1, alignSelf: "stretch", background: C.hair, flexShrink: 0 }} />
           <div style={{ flex: "1 1 0", minWidth: 0 }}>
-            <div style={{ fontSize: 10, letterSpacing: ".05em", textTransform: "uppercase", color: C.inkSoft }}>Income & saving (today’s $)</div>
-            <div style={{ fontFamily: serif, fontSize: 17, color: C.ink, lineHeight: 1.15 }}>
-              {s.jobChange ? `${compact(s.income)} → ${compact(s.incomeAfter)}` : compact(s.income)}
+            <div style={{ fontSize: 10, letterSpacing: ".05em", textTransform: "uppercase", color: C.inkSoft }}>
+              {scopeLabel}income & saving
             </div>
-            <div style={{ fontFamily: mono, fontSize: 11, color: C.inkSoft, lineHeight: 1.3 }}>
-              save {savedLabel("before")}{s.jobChange ? ` → ${savedLabel("after")}` : ""}
-            </div>
-            <div style={{ fontFamily: mono, fontSize: 11, color: savingStatus.color, lineHeight: 1.3 }}>
-              {s.jobChange ? "after change: " : ""}{savingStatus.text}
-            </div>
+            <div style={{ fontFamily: serif, fontSize: 17, color: C.ink, lineHeight: 1.15 }}>{compact(incomeNow)}/yr</div>
+            <div style={{ fontFamily: mono, fontSize: 11, color: C.inkSoft, lineHeight: 1.3 }}>save {compact(savedNow)}/yr now</div>
+            <div style={{ fontFamily: mono, fontSize: 11, color: savingStatus.color, lineHeight: 1.3 }}>{savingStatus.text}</div>
           </div>
         </div>
       </div>
