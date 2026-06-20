@@ -1,8 +1,11 @@
-import { useState, useMemo, useEffect } from "react";
+import { useState, useMemo, useEffect, useRef } from "react";
 import {
   LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip,
   ResponsiveContainer, ReferenceDot, ReferenceLine, Legend,
 } from "recharts";
+import { listen } from "@tauri-apps/api/event";
+import { invoke } from "@tauri-apps/api/core";
+import { open as openFolder, ask, message } from "@tauri-apps/plugin-dialog";
 
 // ---- palettes --------------------------------------------------------------
 // Two themes; the active one is selected at render time and threaded through
@@ -220,28 +223,37 @@ const DEFAULTS = {
 };
 const STORAGE_KEY = "retirement-crossover-settings";
 const THEME_KEY = "retirement-crossover-theme";
+const DATADIR_KEY = "retirement-crossover-datadir";
+const DATA_FILENAME = "retirement-planner-data.json";
+
+const isTauri = typeof window !== "undefined" && !!window.__TAURI_INTERNALS__;
+const dataFilePath = (dir) => `${dir.replace(/\/+$/, "")}/${DATA_FILENAME}`;
 
 // Persisted shape: { people: [{ name, settings }], activeIndex }. Older builds
 // stored a single flat settings object — migrate that into one person.
+function coerceStore(parsed) {
+  if (parsed && Array.isArray(parsed.people) && parsed.people.length) {
+    const people = parsed.people.map((p, i) => ({
+      name: typeof p.name === "string" ? p.name : `Person ${i + 1}`,
+      settings: { ...DEFAULTS, ...(p.settings || {}) },
+    }));
+    const activeIndex = Math.min(Math.max(0, parsed.activeIndex | 0), people.length - 1);
+    return { people, activeIndex };
+  }
+  if (parsed && typeof parsed === "object") {
+    return { people: [{ name: "Person 1", settings: { ...DEFAULTS, ...parsed } }], activeIndex: 0 };
+  }
+  return { people: [{ name: "Person 1", settings: DEFAULTS }], activeIndex: 0 };
+}
 function loadState() {
   try {
     const raw = localStorage.getItem(STORAGE_KEY);
-    if (raw) {
-      const parsed = JSON.parse(raw);
-      if (parsed && Array.isArray(parsed.people) && parsed.people.length) {
-        const people = parsed.people.map((p, i) => ({
-          name: typeof p.name === "string" ? p.name : `Person ${i + 1}`,
-          settings: { ...DEFAULTS, ...(p.settings || {}) },
-        }));
-        const activeIndex = Math.min(Math.max(0, parsed.activeIndex | 0), people.length - 1);
-        return { people, activeIndex };
-      }
-      if (parsed && typeof parsed === "object") {
-        return { people: [{ name: "Person 1", settings: { ...DEFAULTS, ...parsed } }], activeIndex: 0 };
-      }
-    }
+    if (raw) return coerceStore(JSON.parse(raw));
   } catch (e) { /* ignore */ }
   return { people: [{ name: "Person 1", settings: DEFAULTS }], activeIndex: 0 };
+}
+function loadDataDir() {
+  try { return localStorage.getItem(DATADIR_KEY) || null; } catch (e) { return null; }
 }
 function loadTheme() {
   try {
@@ -256,21 +268,85 @@ export default function App() {
   const [saveState, setSaveState] = useState("idle");
   const [theme, setTheme] = useState(loadTheme);
   const [viewMode, setViewMode] = useState("combined"); // "combined" | "perPerson"
+  const [dataDir, setDataDir] = useState(loadDataDir); // external folder, or null = localStorage
   const C = THEMES[theme];
 
   const { people, activeIndex } = store;
   const s = people[activeIndex].settings; // active person's settings (left column)
 
+  const storeRef = useRef(store);
+  storeRef.current = store;
+  const fileReady = useRef(!(isTauri && dataDir)); // gate file writes until first load done
+  const writeTimer = useRef(null);
+
+  // On launch, if a data folder is set, load the store from its file.
   useEffect(() => {
-    try {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(store));
-      setSaveState("saved");
-      const t = setTimeout(() => setSaveState("idle"), 1400);
-      return () => clearTimeout(t);
-    } catch (e) {
-      console.error("Could not save settings", e);
+    if (!isTauri || !dataDir) { fileReady.current = true; return; }
+    let cancelled = false;
+    invoke("read_data", { path: dataFilePath(dataDir) })
+      .then((text) => { if (!cancelled && text) setStore(coerceStore(JSON.parse(text))); })
+      .catch((e) => console.error("Could not read data folder", e))
+      .finally(() => { fileReady.current = true; });
+    return () => { cancelled = true; };
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Persist on every change: always to localStorage (cache + pointer), and to the
+  // chosen data folder (debounced) when one is set.
+  useEffect(() => {
+    try { localStorage.setItem(STORAGE_KEY, JSON.stringify(store)); } catch (e) { console.error("Could not save settings", e); }
+    setSaveState("saved");
+    const t = setTimeout(() => setSaveState("idle"), 1400);
+    if (isTauri && dataDir && fileReady.current) {
+      if (writeTimer.current) clearTimeout(writeTimer.current);
+      writeTimer.current = setTimeout(() => {
+        invoke("write_data", { path: dataFilePath(dataDir), contents: JSON.stringify(store) })
+          .catch((e) => console.error("Could not write to data folder", e));
+      }, 500);
     }
-  }, [store]);
+    return () => clearTimeout(t);
+  }, [store, dataDir]);
+
+  // Native "File → Choose Data Folder…" menu item drives this flow.
+  const chooseDataFolder = async () => {
+    try {
+      const dir = await openFolder({ directory: true, multiple: false,
+        title: "Choose a folder to store your data",
+        defaultPath: dataDir || undefined });
+      if (!dir || typeof dir !== "string") return;
+      const path = dataFilePath(dir);
+      const exists = await invoke("data_exists", { path });
+      if (exists) {
+        const useExisting = await ask(
+          "This folder already contains Retirement Planner data.\n\nUse the data that's already there? Choosing “No” overwrites it with your current data.",
+          { title: "Existing data found", kind: "warning", okLabel: "Use existing", cancelLabel: "Overwrite" });
+        if (useExisting) {
+          const text = await invoke("read_data", { path });
+          setStore(coerceStore(JSON.parse(text)));
+        } else {
+          await invoke("write_data", { path, contents: JSON.stringify(storeRef.current) });
+        }
+      } else {
+        const ok = await ask(
+          `Store your data in:\n${dir}\n\nYour current data will be copied here and the app will use it from now on.`,
+          { title: "Use this folder?", okLabel: "Store here", cancelLabel: "Cancel" });
+        if (!ok) return;
+        await invoke("write_data", { path, contents: JSON.stringify(storeRef.current) });
+      }
+      fileReady.current = true;
+      setDataDir(dir);
+      try { localStorage.setItem(DATADIR_KEY, dir); } catch (e) { /* ignore */ }
+      await message(`Now storing data in:\n${dir}`, { title: "Data location set" });
+    } catch (e) {
+      console.error("Choose data folder failed", e);
+      try { await message("Could not set the data folder.\n\n" + e, { title: "Error", kind: "error" }); } catch (_) { /* ignore */ }
+    }
+  };
+
+  useEffect(() => {
+    if (!isTauri) return;
+    const unlisten = listen("menu-choose-data-folder", () => chooseDataFolder());
+    return () => { unlisten.then((f) => f()); };
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   // --- people (tabs) ---
   const selectPerson = (index) => setStore((st) => ({ ...st, activeIndex: index }));
