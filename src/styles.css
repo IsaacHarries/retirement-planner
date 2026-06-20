@@ -1,0 +1,4 @@
+html, body, #root { height: 100%; }
+/* Dark by default; App.jsx overrides body background to match the active theme. */
+body { margin: 0; background: #121212; }
+* { box-sizing: border-box; }

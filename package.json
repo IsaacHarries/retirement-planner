@@ -1,0 +1,25 @@
+{
+  "name": "retirement-planner",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "A desktop retirement projection calculator (the 'crossover' between savings and the inflation-adjusted target).",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "tauri": "tauri",
+    "app": "tauri dev",
+    "app:build": "tauri build"
+  },
+  "dependencies": {
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "recharts": "^2.12.7"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.1.0",
+    "@vitejs/plugin-react": "^4.3.4",
+    "vite": "^5.4.11"
+  }
+}
